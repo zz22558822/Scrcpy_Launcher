@@ -1,0 +1,13 @@
+python -m nuitka Scrcpy_Launcher.py ^
+  --onefile ^
+  --enable-plugin=pyqt6 ^
+  --windows-console-mode=disable ^
+  --windows-icon-from-ico=LOGO.ico ^
+  --company-name="Chek" ^
+  --product-name="Scrcpy 啟動器" ^
+  --file-version=1.0.0 ^
+  --product-version=1.0.0 ^
+  --file-description="Android 螢幕鏡像參數設定工具" ^
+  --copyright="Copyright c 2026 Chek" ^
+  --output-dir=build ^
+  --remove-output
