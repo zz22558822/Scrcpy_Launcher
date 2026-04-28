@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QSettings, QTimer, QObject, pyqtSignal,
-    QRegularExpression,
+    QRegularExpression, QThread,
 )
 from PyQt6.QtGui import (
     QFont, QPainter, QColor, QLinearGradient, QBrush, QPen,
@@ -20,7 +20,7 @@ from PyQt6.QtGui import (
 )
 
 # ══════════════════════════════════════════════════════════════
-#  LOGO 圖示 
+#  LOGO 圖示
 # ══════════════════════════════════════════════════════════════
 
 LOGO_ICON_BASE64 = """
@@ -90,13 +90,20 @@ QComboBox {{
 }}
 QComboBox:hover  {{ border-color: {C['border_hi']}; }}
 QComboBox:focus  {{ border-color: {C['accent']}; }}
-QComboBox::drop-down {{ border: none; width: 28px; }}
-QComboBox::down-arrow {{
-    border-left:  4px solid transparent;
-    border-right: 4px solid transparent;
+QComboBox::drop-down {{
+    border: none;
+    width: 32px;
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+}}
+/* QComboBox::down-arrow {{
+    width: 10px;
+    height: 6px;
+    border-left:  5px solid transparent;
+    border-right: 5px solid transparent;
     border-top:   6px solid {C['sub']};
     margin-right: 10px;
-}}
+}} */
 QComboBox QAbstractItemView {{
     background: {C['card']};
     border: 1.5px solid {C['border_hi']};
@@ -106,6 +113,10 @@ QComboBox QAbstractItemView {{
     outline: none;
     padding: 3px;
     font-size: 13px;
+}}
+QComboBox:disabled {{
+    color: {C['muted']};
+    border-color: {C['border']};
 }}
 
 /* 勾選框 */
@@ -163,18 +174,15 @@ QMessageBox QPushButton:hover {{
 # ══════════════════════════════════════════════════════════════
 #  輸入驗證 Regex
 # ══════════════════════════════════════════════════════════════
-# IP:Port  例如 192.168.1.100:5555（Port 可選）
 _IP_RE   = QRegularExpression(
     r"^(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?$"
 )
-# Bitrate  例如 8M, 16M, 2000K, 500000（純數字）
 _BITR_RE = QRegularExpression(
     r"^\d+[KkMmGg]?$"
 )
 
 
 def _validate_ip(text: str) -> bool:
-    """空字串 = USB，視為合法；否則檢查格式。"""
     if not text:
         return True
     m = _IP_RE.match(text)
@@ -185,25 +193,92 @@ def _validate_ip(text: str) -> bool:
 
 
 def _validate_bitrate(text: str) -> bool:
-    """空字串 = 使用預設，視為合法。"""
     if not text:
         return True
     return bool(_BITR_RE.match(text).hasMatch())
 
 
 # ══════════════════════════════════════════════════════════════
+#  ADB 設備掃描（背景執行緒，避免 UI 凍結）
+# ══════════════════════════════════════════════════════════════
+class AdbScanner(QThread):
+    """在背景執行 `adb devices`，完成後發出 devices 訊號。"""
+    devices_ready = pyqtSignal(list)   # list of (serial, display_name)
+
+    def __init__(self, adb_path: str = "adb", parent=None):
+        super().__init__(parent)
+        self._adb = adb_path
+
+    def run(self):
+        results = []
+        try:
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            proc = subprocess.run(
+                [self._adb, "devices", "-l"],
+                capture_output=True, text=True,
+                timeout=6, creationflags=flags,
+            )
+            lines = proc.stdout.splitlines()
+            for line in lines[1:]:           # 跳過第一行 "List of devices attached"
+                line = line.strip()
+                if not line or line.startswith("*"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                serial = parts[0]
+                state  = parts[1]
+                if state != "device":        # 跳過 offline / unauthorized
+                    continue
+
+                # 解析額外資訊（model、product 等）
+                tags = {}
+                for seg in parts[2:]:
+                    if ":" in seg:
+                        k, _, v = seg.partition(":")
+                        tags[k] = v
+
+                model   = tags.get("model", "")
+                product = tags.get("product", "")
+
+                # 組出人性化名稱
+                if model:
+                    label = f"{model}  [{serial}]"
+                elif product:
+                    label = f"{product}  [{serial}]"
+                else:
+                    label = serial
+
+                results.append((serial, label))
+        except FileNotFoundError:
+            results = []          # adb 不存在
+        except subprocess.TimeoutExpired:
+            results = []
+        except Exception:
+            results = []
+
+        self.devices_ready.emit(results)
+
+
+# ══════════════════════════════════════════════════════════════
 #  自訂按鈕（QPainter 繪製，帶 Glow）
 # ══════════════════════════════════════════════════════════════
 class GlowBtn(QPushButton):
-    def __init__(self, text: str, danger: bool = False, parent=None):
+    def __init__(self, text: str, danger: bool = False,
+                 color: str = "", small: bool = False, parent=None):
         super().__init__(parent)
         self.setText(text)
-        self._col   = QColor(C['danger'] if danger else C['accent'])
+        _c = color if color else (C['danger'] if danger else C['accent'])
+        self._col   = QColor(_c)
         self._hov   = False
         self._down  = False
-        self.setFixedHeight(44)
+        self._small = small
+        h = 36 if small else 44
+        self.setFixedHeight(h)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setFont(QFont("Microsoft JhengHei UI", 13, QFont.Weight.DemiBold))
+        # small 按鈕（掃描）用較小字體；主要按鈕放大到 15pt
+        fs = 12
+        self.setFont(QFont("Microsoft JhengHei UI", fs, QFont.Weight.DemiBold))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def enterEvent(self, e):  self._hov  = True;  self.update()
@@ -216,7 +291,9 @@ class GlowBtn(QPushButton):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r  = self.rect().adjusted(2, 2, -2, -2)
+
+        # r = 主體繪製區域，留 2px 邊距讓 glow 有空間但不溢出 widget
+        r  = self.rect().adjusted(3, 3, -3, -3)
         rr = 9
 
         base = QColor(self._col)
@@ -225,28 +302,38 @@ class GlowBtn(QPushButton):
         elif self._down:
             base = base.darker(130)
         elif self._hov:
-            base = base.lighter(120)
+            base = base.lighter(115)
 
-        # 輝光邊框
-        if self._hov and self.isEnabled() and not self._down:
-            glow = QColor(base); glow.setAlpha(50)
-            p.setPen(QPen(glow, 8))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r.adjusted(-1, -1, 1, 1), rr + 2, rr + 2)
+        # ── Glow：用「稍大的半透明 path」畫在主體下方，完全不超出 widget ──
+        # 只比 r 各向外擴 2px，最多到 widget 邊緣（adjusted(-1) 確保安全）
+        if self._hov and self.isEnabled() and not self._down and not self._small:
+            glow_col = QColor(base)
+            glow_col.setAlpha(55)
+            glow_path = QPainterPath()
+            gr = self.rect().adjusted(1, 1, -1, -1)   # 嚴格在 widget 內
+            glow_path.addRoundedRect(
+                float(gr.x()), float(gr.y()),
+                float(gr.width()), float(gr.height()), rr + 2, rr + 2
+            )
+            p.setPen(Qt.PenStyle.NoPen)
+            p.fillPath(glow_path, QBrush(glow_col))
 
-        # 漸層填充
-        g = QLinearGradient(0, 0, 0, r.height())
+        # ── 主體漸層 ──
+        g = QLinearGradient(0, float(r.y()), 0, float(r.y() + r.height()))
         g.setColorAt(0, base.lighter(110))
-        g.setColorAt(1, base.darker(115))
-        path = QPainterPath()
-        path.addRoundedRect(float(r.x()), float(r.y()),
-                            float(r.width()), float(r.height()), rr, rr)
+        g.setColorAt(1, base.darker(118))
+        body_path = QPainterPath()
+        body_path.addRoundedRect(float(r.x()), float(r.y()),
+                                 float(r.width()), float(r.height()), rr, rr)
         p.setPen(Qt.PenStyle.NoPen)
-        p.fillPath(path, QBrush(g))
+        p.fillPath(body_path, QBrush(g))
 
-        # 文字
+        # ── 文字：強制使用自訂字體，不受 QSS 繼承影響 ──
+        fs = 12
+        font = QFont("Microsoft JhengHei UI", fs, QFont.Weight.DemiBold)
+        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        p.setFont(font)
         p.setPen(QColor("#FFFFFF") if self.isEnabled() else QColor(C['sub']))
-        p.setFont(self.font())
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
         p.end()
 
@@ -258,7 +345,6 @@ class Card(QFrame):
     def __init__(self, icon_char: str, title: str, parent=None):
         super().__init__(parent)
         self.setObjectName("ScCard")
-        # 只設定 Frame 自身，不影響子控件背景繼承
         self.setStyleSheet("""
             QFrame#ScCard {
                 background: """ + C['surface'] + """;
@@ -271,7 +357,6 @@ class Card(QFrame):
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(0)
 
-        # ── 標題列 ──
         hdr = QWidget()
         hdr.setObjectName("ScCardHdr")
         hdr.setFixedHeight(38)
@@ -286,15 +371,10 @@ class Card(QFrame):
         hrow.setContentsMargins(14, 0, 14, 0)
         hrow.setSpacing(7)
 
-        # 彩色小圓點作為視覺錨點（取代 emoji，避免字體問題）
         dot = QFrame()
         dot.setFixedSize(8, 8)
-        dot.setStyleSheet(f"""
-            background: {C['accent']};
-            border-radius: 4px;
-        """)
+        dot.setStyleSheet(f"background: {C['accent']}; border-radius: 4px;")
 
-        # icon 文字
         ic = QLabel(icon_char)
         ic.setFixedWidth(18)
         ic.setStyleSheet(
@@ -306,20 +386,17 @@ class Card(QFrame):
             "font-size:13px; font-weight:700; color:" + C['txt'] + "; background:transparent;"
         )
 
-        # 分隔線在 hdr 下方
         hrow.addWidget(dot)
         hrow.addWidget(ic)
         hrow.addWidget(tl)
         hrow.addStretch()
         vbox.addWidget(hdr)
 
-        # hdr 下緣分隔線
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet(f"background: {C['border']}; border: none;")
         vbox.addWidget(sep)
 
-        # ── 內容區 ──
         body_w = QWidget()
         body_w.setObjectName("ScCardBody")
         body_w.setStyleSheet("QWidget#ScCardBody { background: transparent; }")
@@ -333,7 +410,7 @@ class Card(QFrame):
 
 
 # ══════════════════════════════════════════════════════════════
-#  輔助：標籤列（label + widget）
+#  輔助：標籤列
 # ══════════════════════════════════════════════════════════════
 def _field_row(label: str, widget: QWidget, tip: str = "") -> QHBoxLayout:
     lbl = QLabel(label)
@@ -351,13 +428,14 @@ def _field_row(label: str, widget: QWidget, tip: str = "") -> QHBoxLayout:
 
 
 # ══════════════════════════════════════════════════════════════
-#  狀態徽章（獨立 Widget，避免 badge 寬度跳動）
+#  狀態徽章
 # ══════════════════════════════════════════════════════════════
 class StatusBadge(QLabel):
     _STYLES = {
-        "idle":    ("待機",    C['sub'],   C['dim']),
-        "running": ("● 執行中", "#FFFFFF", C['accent2'] + "CC"),
-        "error":   ("● 已中斷", "#FFFFFF", C['danger']  + "AA"),
+        "idle":       ("待機",      C['sub'],   C['dim']),
+        "running":    ("● 執行中",  "#FFFFFF",  C['accent2'] + "CC"),
+        "error":      ("● 已中斷",  "#FFFFFF",  C['danger']  + "AA"),
+        "scanning":   ("⟳ 掃描中",  "#FFFFFF",  C['warn']    + "BB"),
     }
 
     def __init__(self, parent=None):
@@ -376,10 +454,10 @@ class StatusBadge(QLabel):
 
 
 # ══════════════════════════════════════════════════════════════
-#  進程監控（QObject + QTimer，訊號安全派發）
+#  進程監控
 # ══════════════════════════════════════════════════════════════
 class ProcWatcher(QObject):
-    finished = pyqtSignal(int)   # 結束碼（任何退出都會觸發）
+    finished = pyqtSignal(int)
 
     def __init__(self, proc: subprocess.Popen, parent: QObject = None):
         super().__init__(parent)
@@ -414,43 +492,121 @@ class ScrcpyLauncher(QWidget):
 
     ORG  = "Scrcpy Launcher"
     KEY  = "Scrcpy Launcher"
-    W, H = 475, 680      # 精確計算後的固定尺寸
+    W, H = 475, 820      # 寬度 高度
 
     def __init__(self):
         super().__init__()
-        self.settings   = QSettings(self.ORG, self.KEY)
-        self._proc:    subprocess.Popen | None = None
-        self._watcher: ProcWatcher       | None = None
-        self._launching = False            # 防止重複點擊
-        self._load_icon() # 初始化時載入 ICON
+        self.settings    = QSettings(self.ORG, self.KEY)
+        self._proc:     subprocess.Popen | None = None
+        self._watcher:  ProcWatcher       | None = None
+        self._scanner:  AdbScanner        | None = None
+        self._launching = False
+        # 儲存設備清單：list of (serial, label)
+        self._devices: list[tuple[str, str]] = []
+        self._load_icon()
         self._build_ui()
         self._load_settings()
+        # 啟動時自動掃描一次
+        QTimer.singleShot(300, self._scan_devices)
 
-    # LOGO 圖示
+    # ──────────────────────────────────────────────────
+    #  LOGO
+    # ──────────────────────────────────────────────────
     def _load_icon(self):
-            """從 Base64 字串載入圖示並設定給主視窗"""
-            if LOGO_ICON_BASE64.strip():
-                try:
-                    icon_data = base64.b64decode(LOGO_ICON_BASE64.strip())
-                    pixmap = QPixmap()
-                    if pixmap.loadFromData(icon_data):
-                        icon = QIcon(pixmap)
-                        self.setWindowIcon(icon)
-                    else:
-                        print("警告：QPixmap 無法從 Base64 解碼的資料中載入圖像。")
-                except base64.binascii.Error:
-                    print("錯誤：Base64 字串格式不正確，無法解碼。")
-                except Exception as e:
-                    print(f"無法從 Base64 資料載入圖示: {e}")
-            else:
-                print("警告：LOGO_ICON_BASE64 為空，將不顯示應用程式圖示。")
+        if LOGO_ICON_BASE64.strip():
+            try:
+                icon_data = base64.b64decode(LOGO_ICON_BASE64.strip())
+                pixmap = QPixmap()
+                if pixmap.loadFromData(icon_data):
+                    self.setWindowIcon(QIcon(pixmap))
+            except Exception as e:
+                print(f"無法載入圖示: {e}")
+
+    # ──────────────────────────────────────────────────
+    #  找 adb 路徑（與 scrcpy 同目錄，或 PATH）
+    # ──────────────────────────────────────────────────
+    def _find_adb(self) -> str:
+        try:
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        except Exception:
+            base_dir = os.getcwd()
+        local = os.path.join(base_dir, "adb.exe" if sys.platform == "win32" else "adb")
+        return local if os.path.isfile(local) else "adb"
+
+    # ──────────────────────────────────────────────────
+    #  掃描設備
+    # ──────────────────────────────────────────────────
+    def _scan_devices(self):
+        """觸發背景 ADB 掃描，掃描中鎖定按鈕避免重複點擊。"""
+        if self._scanner and self._scanner.isRunning():
+            return  # 已在掃描中
+
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("掃描中...")
+        self._badge.set_state("scanning")
+
+        self._scanner = AdbScanner(self._find_adb(), self)
+        self._scanner.devices_ready.connect(self._on_devices_ready)
+        self._scanner.start()
+
+    def _on_devices_ready(self, devices: list[tuple[str, str]]):
+        self._devices = devices
+        self._populate_device_combo(devices)
+
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setText("↻ 刷新")
+
+        # 若鏡像未在執行中，恢復待機徽章
+        if self._proc is None or self._proc.poll() is not None:
+            self._badge.set_state("idle")
+
+    def _populate_device_combo(self, devices: list[tuple[str, str]]):
+        prev = self.device_combo.currentData()   # 記住先前選的 serial
+
+        self.device_combo.clear()
+        if not devices:
+            self.device_combo.addItem("（未偵測到裝置）", userData=None)
+            self.device_combo.setEnabled(False)
+        else:
+            self.device_combo.setEnabled(True)
+            for serial, label in devices:
+                self.device_combo.addItem(label, userData=serial)
+
+            # 嘗試還原先前選擇；否則預設選第一台
+            restored = False
+            if prev:
+                for i in range(self.device_combo.count()):
+                    if self.device_combo.itemData(i) == prev:
+                        self.device_combo.setCurrentIndex(i)
+                        restored = True
+                        break
+            if not restored:
+                self.device_combo.setCurrentIndex(0)
+
+        self._update_device_hint()
+
+    def _update_device_hint(self):
+        """根據當前選擇更新提示標籤。"""
+        serial = self.device_combo.currentData()
+        count  = len(self._devices)
+
+        if count == 0:
+            txt   = "找不到裝置，請確認 ADB 已安裝且裝置已啟用 USB 偵錯"
+            color = C['warn']
+        else:
+            txt   = f"已選定：{serial}"
+            color = C['accent2']
+
+        self._dev_hint.setText(txt)
+        self._dev_hint.setStyleSheet(
+            f"color:{color}; font-size:11.5px; background:transparent;"
+        )
 
     # ──────────────────────────────────────────────────
     #  建立介面
     # ──────────────────────────────────────────────────
     def _build_ui(self):
         self.setWindowTitle("Scrcpy 啟動器")
-        # 固定大小 + 只保留最小化/關閉（無最大化/縮放）
         self.setFixedSize(self.W, self.H)
         self.setWindowFlags(
             Qt.WindowType.Window |
@@ -479,7 +635,6 @@ class ScrcpyLauncher(QWidget):
         hdr_l.setContentsMargins(14, 0, 14, 0)
         hdr_l.setSpacing(12)
 
-        # 漸層圖示方塊（純色繪製，不用 emoji 避免字體問題）
         icon_f = QFrame()
         icon_f.setFixedSize(40, 40)
         icon_f.setStyleSheet(f"""
@@ -495,7 +650,6 @@ class ScrcpyLauncher(QWidget):
             " background:transparent; border:none;"
         )
 
-        # 文字區
         txt_col = QVBoxLayout()
         txt_col.setSpacing(2)
         txt_col.setContentsMargins(0, 0, 0, 0)
@@ -516,6 +670,40 @@ class ScrcpyLauncher(QWidget):
         hdr_l.addLayout(txt_col, 1)
         hdr_l.addWidget(self._badge)
         root.addWidget(hdr_f)
+
+        # ════════════ 裝置選擇（新增）════════════
+        dev_card = Card("📱", "裝置選擇")
+
+        # 下拉 + 重新整理按鈕同列
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(8)
+        dev_row.setContentsMargins(0, 0, 0, 0)
+
+        self.device_combo = QComboBox()
+        self.device_combo.setToolTip("選擇要投影的 Android 裝置或模擬器")
+        self.device_combo.addItem("（點擊重新整理以掃描裝置）", userData=None)
+        self.device_combo.setEnabled(False)
+        self.device_combo.currentIndexChanged.connect(
+            lambda _: self._update_device_hint()
+        )
+
+        self.btn_scan = GlowBtn("↻ 刷新", color="#1E6B4A", small=True)
+        self.btn_scan.setFixedWidth(90)
+        self.btn_scan.setFixedHeight(46)
+        self.btn_scan.clicked.connect(self._scan_devices)
+
+        dev_row.addWidget(self.device_combo, 1)
+        dev_row.addWidget(self.btn_scan)
+
+        # 提示文字
+        self._dev_hint = QLabel("")
+        self._dev_hint.setStyleSheet(
+            f"color:{C['sub']}; font-size:11.5px; background:transparent;"
+        )
+
+        dev_card.body().addLayout(dev_row)
+        dev_card.body().addWidget(self._dev_hint)
+        root.addWidget(dev_card)
 
         # ════════════ 連線設定 ════════════
         conn_card = Card("🔌", "連線設定")
@@ -570,7 +758,6 @@ class ScrcpyLauncher(QWidget):
         self.cb_no_audio     = _cb("停用音訊傳輸",    "不傳輸手機音訊，可降低延遲（--no-audio）")
         self.cb_fullscreen   = _cb("全螢幕模式",      "以全螢幕方式開啟鏡像視窗（--fullscreen）")
 
-        # 兩欄等寬排列
         cb_row_w = QWidget()
         cb_row_w.setStyleSheet("background: transparent;")
         cb_hl = QHBoxLayout(cb_row_w)
@@ -595,10 +782,12 @@ class ScrcpyLauncher(QWidget):
         btn_row.setSpacing(10)
 
         self.btn_launch = GlowBtn("▶   啟動鏡像")
+        self.btn_launch.setFixedHeight(46)
         self.btn_launch.clicked.connect(self._launch)
 
         self.btn_stop = GlowBtn("■   停止", danger=True)
         self.btn_stop.setFixedWidth(110)
+        self.btn_stop.setFixedHeight(46)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
 
@@ -607,7 +796,6 @@ class ScrcpyLauncher(QWidget):
         root.addLayout(btn_row)
 
         # ════════════ 底部提示 ════════════
-        # 用分隔線 + 說明文字提升視覺層次
         bot_sep = QFrame()
         bot_sep.setFixedHeight(1)
         bot_sep.setStyleSheet(f"background: {C['border']}; border: none;")
@@ -635,6 +823,7 @@ class ScrcpyLauncher(QWidget):
         self.cb_show_touches.setChecked(   s.value("show_touches", False, type=bool))
         self.cb_no_audio.setChecked(       s.value("no_audio",     False, type=bool))
         self.cb_fullscreen.setChecked(     s.value("fullscreen",   False, type=bool))
+        # 設備 serial 在掃描完成後才能還原，由 _on_devices_ready 處理
 
     def _save_settings(self):
         s = self.settings
@@ -648,10 +837,13 @@ class ScrcpyLauncher(QWidget):
         s.setValue("show_touches", self.cb_show_touches.isChecked())
         s.setValue("no_audio",     self.cb_no_audio.isChecked())
         s.setValue("fullscreen",   self.cb_fullscreen.isChecked())
+        # 儲存選定的 serial
+        serial = self.device_combo.currentData()
+        s.setValue("last_serial", serial if serial else "")
         try:
             s.sync()
         except Exception:
-            pass  # 磁碟滿或唯讀時靜默略過
+            pass
 
     # ──────────────────────────────────────────────────
     #  指令建構
@@ -667,6 +859,12 @@ class ScrcpyLauncher(QWidget):
 
         cmd = [exe]
 
+        # ── 指定裝置 ──
+        serial = self.device_combo.currentData()
+        if serial:          # None = 未掃描到任何裝置，略過
+            cmd += ["--serial", serial]
+
+        # ── 其餘參數 ──
         ip = self.ip_edit.text().strip()
         if ip:
             cmd.append("--tcpip=" + ip)
@@ -693,10 +891,9 @@ class ScrcpyLauncher(QWidget):
         return cmd
 
     # ──────────────────────────────────────────────────
-    #  輸入驗證（啟動前呼叫）
+    #  輸入驗證
     # ──────────────────────────────────────────────────
     def _validate_inputs(self) -> str | None:
-        """回傳錯誤訊息字串；合法時回傳 None。"""
         ip = self.ip_edit.text().strip()
         if not _validate_ip(ip):
             self.ip_edit.setFocus()
@@ -717,18 +914,18 @@ class ScrcpyLauncher(QWidget):
                 "  16M   （16 Mbps）\n"
                 "  2000K （2 Mbps）"
             )
+
         return None
 
     # ──────────────────────────────────────────────────
     #  UI 狀態同步
     # ──────────────────────────────────────────────────
     def _set_running(self, state: str):
-        """
-        state = 'running' | 'idle' | 'error'
-        """
         running = (state == "running")
         self.btn_launch.setEnabled(not running)
         self.btn_stop.setEnabled(running)
+        self.btn_scan.setEnabled(not running)
+        self.device_combo.setEnabled(not running and bool(self._devices))
         self.btn_launch.update()
         self.btn_stop.update()
         self._badge.set_state(state)
@@ -741,29 +938,25 @@ class ScrcpyLauncher(QWidget):
             return
         self._launching = True
 
-        # 驗證輸入
         err = self._validate_inputs()
-        if err:
+        if err is not None:
             self._launching = False
             QMessageBox.warning(self, "輸入格式錯誤", err)
             return
 
         self._save_settings()
-
         cmd = self._build_cmd()
 
-        # 決定 cwd：用 exe 所在目錄（方便 scrcpy 找到 adb.exe）
         cwd = None
         if os.path.isfile(cmd[0]):
             cwd = os.path.dirname(os.path.abspath(cmd[0]))
 
         try:
-            flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+            flags = 0x08000000 if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
                 cmd,
                 creationflags=flags,
                 cwd=cwd,
-                # 不繼承 stdin/stdout/stderr，避免 pipe 阻塞
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -795,7 +988,6 @@ class ScrcpyLauncher(QWidget):
             QMessageBox.critical(self, "未知錯誤", f"啟動時發生意外錯誤：\n{e}")
             return
 
-        # 啟動進程監控
         self._watcher = ProcWatcher(self._proc, self)
         self._watcher.finished.connect(self._on_proc_finished)
 
@@ -803,12 +995,11 @@ class ScrcpyLauncher(QWidget):
         self._launching = False
 
     # ──────────────────────────────────────────────────
-    #  停止（非阻塞）
+    #  停止
     # ──────────────────────────────────────────────────
     def _stop(self):
         self._cleanup_watcher()
 
-        # 先嘗試優雅終止
         if self._proc is not None:
             try:
                 if self._proc.poll() is None:
@@ -817,12 +1008,11 @@ class ScrcpyLauncher(QWidget):
                 pass
             self._proc = None
 
-        # Windows 備援：以獨立子進程 taskkill，不阻塞主線程
         if sys.platform == "win32":
             try:
                 subprocess.Popen(
                     ["taskkill", "/f", "/im", "scrcpy.exe"],
-                    creationflags=0x08000000,      # CREATE_NO_WINDOW
+                    creationflags=0x08000000,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -836,20 +1026,13 @@ class ScrcpyLauncher(QWidget):
     #  進程監控回呼
     # ──────────────────────────────────────────────────
     def _on_proc_finished(self, code: int):
-        """
-        scrcpy 任意方式退出（正常、手機拔除、Wi-Fi 斷線、使用者關閉視窗）
-        都會觸發此函式，確保 UI 狀態同步。
-        """
         self._cleanup_watcher()
         self._proc = None
 
         if code == 0:
-            # 正常退出
             self._set_running("idle")
         else:
-            # 異常退出（拔掉 USB / 斷線 / 裝置錯誤…）
             self._set_running("error")
-            # 用非阻塞的單次 Timer 延遲顯示，避免在 signal 回呼中直接開視窗
             QTimer.singleShot(100, self._show_disconnect_hint)
 
     def _show_disconnect_hint(self):
@@ -862,7 +1045,6 @@ class ScrcpyLauncher(QWidget):
             "· 手機螢幕已鎖定或裝置授權逾時\n\n"
             "確認裝置後可重新啟動鏡像。",
         )
-        # 確認後回到待機狀態
         self._set_running("idle")
 
     def _cleanup_watcher(self):
@@ -874,18 +1056,10 @@ class ScrcpyLauncher(QWidget):
     #  關閉事件
     # ──────────────────────────────────────────────────
     def closeEvent(self, e):
-        # 若 scrcpy 仍在執行，先停止再關閉
         self._cleanup_watcher()
-
-        # 關閉啟動器時關閉 scrcpy
-        # if self._proc is not None:
-        #     try:
-        #         if self._proc.poll() is None:
-        #             self._proc.terminate()
-        #     except Exception:
-        #         pass
-        #     self._proc = None
-
+        if self._scanner and self._scanner.isRunning():
+            self._scanner.quit()
+            self._scanner.wait(1000)
         self._save_settings()
         super().closeEvent(e)
 
@@ -894,7 +1068,6 @@ class ScrcpyLauncher(QWidget):
 #  程式入口
 # ══════════════════════════════════════════════════════════════
 def main():
-    # Windows 高 DPI：在 QApplication 建立前宣告
     if sys.platform == "win32":
         try:
             from ctypes import windll
